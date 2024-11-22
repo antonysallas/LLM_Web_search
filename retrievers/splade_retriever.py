@@ -1,13 +1,7 @@
-from typing import (
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    Dict
-)
+from typing import Dict, Iterable, List, Optional, Tuple
 
-import torch
 import numpy as np
+import torch
 from scipy.sparse import csr_array
 
 try:
@@ -15,12 +9,38 @@ try:
 except:
     from utils import Document
 
+import gc
+
+
+# Modify the device selection:
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+device = get_device()
+print(f"Device used in Splade Retriever: {device}")
+
+
+# Add this function and use it during generation
+def clear_memory():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        gc.collect()
+        torch.mps.empty_cache()
+        print("MPS cache cleared")
+
 
 class SimilarLengthsBatchifyer:
     """
     Generator class to split samples into batches. Groups sample sequences
     of equal/similar length together to minimize the need for padding within a batch.
     """
+
     def __init__(self, batch_size, inputs, max_padding_len=10):
         # Remember number of samples
         self.num_samples = len(inputs)
@@ -43,7 +63,10 @@ class SimilarLengthsBatchifyer:
         # Use a dynamic batch size to speed up inference at a constant VRAM usage
         self.unique_lengths = sorted(list(self.unique_lengths))
         max_chars_per_batch = self.unique_lengths[-1] * batch_size
-        self.length_to_batch_size = {length: int(max_chars_per_batch / (length * batch_size)) * batch_size for length in self.unique_lengths}
+        self.length_to_batch_size = {
+            length: int(max_chars_per_batch / (length * batch_size)) * batch_size
+            for length in self.unique_lengths
+        }
 
         # Merge samples of similar lengths in those cases where the amount of samples
         # of a particular length is < dynamic batch size
@@ -53,11 +76,12 @@ class SimilarLengthsBatchifyer:
                 accum_len_diff = 0
                 continue
             curr_len = self.unique_lengths[i]
-            prev_len = self.unique_lengths[i-1]
+            prev_len = self.unique_lengths[i - 1]
             len_diff = curr_len - prev_len
-            if (len_diff <= max_padding_len and
-                    (len(self.length_to_sample_indices[curr_len]) < self.length_to_batch_size[curr_len]
-                     or len(self.length_to_sample_indices[prev_len]) < self.length_to_batch_size[prev_len])):
+            if len_diff <= max_padding_len and (
+                len(self.length_to_sample_indices[curr_len]) < self.length_to_batch_size[curr_len]
+                or len(self.length_to_sample_indices[prev_len]) < self.length_to_batch_size[prev_len]
+            ):
                 self.length_to_sample_indices[curr_len].extend(self.length_to_sample_indices[prev_len])
                 self.length_to_sample_indices[prev_len] = []
                 accum_len_diff += len_diff
@@ -95,8 +119,16 @@ def neg_dot_dist(x, y):
 
 
 class SpladeRetriever:
-    def __init__(self, splade_doc_tokenizer, splade_doc_model, splade_query_tokenizer, splade_query_model,
-                 device, batch_size, k):
+    def __init__(
+        self,
+        splade_doc_tokenizer,
+        splade_doc_model,
+        splade_query_tokenizer,
+        splade_query_model,
+        device,
+        batch_size,
+        k,
+    ):
         self.splade_doc_tokenizer = splade_doc_tokenizer
         self.splade_doc_model = splade_doc_model
         self.splade_query_tokenizer = splade_query_tokenizer
@@ -109,7 +141,9 @@ class SpladeRetriever:
         self.metadatas: List[Dict] = []
         self.sparse_doc_vecs: List[csr_array] = []
 
-    def compute_document_vectors(self, texts: List[str], batch_size: int) -> Tuple[List[List[int]], List[List[float]]]:
+    def compute_document_vectors(
+        self, texts: List[str], batch_size: int
+    ) -> Tuple[List[List[int]], List[List[float]]]:
         indices = []
         values = []
         batchifyer = SimilarLengthsBatchifyer(batch_size, texts)
@@ -118,8 +152,9 @@ class SpladeRetriever:
         for index_batch in batchifyer:
             batch_indices.append(index_batch)
             with torch.no_grad():
-                tokens = self.splade_doc_tokenizer(texts[index_batch].tolist(), truncation=True, padding=True,
-                                                   return_tensors="pt").to(self.device)
+                tokens = self.splade_doc_tokenizer(
+                    texts[index_batch].tolist(), truncation=True, padding=True, return_tensors="pt"
+                ).to(self.device)
                 output = self.splade_doc_model(**tokens)
             logits, attention_mask = output.logits, tokens.attention_mask
             relu_log = torch.log(1 + torch.relu(logits))
@@ -157,7 +192,7 @@ class SpladeRetriever:
 
         return query_indices, query_values
 
-    def add_documents(self, documents: List[Document])-> List[str]:
+    def add_documents(self, documents: List[Document]) -> List[str]:
         """Run more documents through the embeddings and add to the vectorstore.
 
         Args:
@@ -170,10 +205,7 @@ class SpladeRetriever:
         metadatas = [doc.metadata for doc in documents]
         return self.add_texts(texts, metadatas)
 
-    def add_texts(
-        self,
-        texts: Iterable[str],
-        metadatas: Optional[List[dict]] = None):
+    def add_texts(self, texts: Iterable[str], metadatas: Optional[List[dict]] = None):
 
         # Remove duplicate and empty texts
         text_to_metadata = {texts[i]: metadatas[i] for i in range(len(texts)) if len(texts[i]) > 0}
@@ -183,17 +215,19 @@ class SpladeRetriever:
         self.metadatas = metadatas
 
         indices, values = self.compute_document_vectors(texts, self.batch_size)
-        self.sparse_doc_vecs = [csr_array((val, (ind,)),
-                                          shape=(self.vocab_size,)) for val, ind in zip(values, indices)]
+        self.sparse_doc_vecs = [
+            csr_array((val, (ind,)), shape=(self.vocab_size,)) for val, ind in zip(values, indices)
+        ]
 
-        if self.device == "cuda":
-            torch.cuda.empty_cache()
+        clear_memory()
+        # if self.device == "cuda":
+        #     torch.cuda.empty_cache()
 
     def get_relevant_documents(self, query: str) -> List[Document]:
         query_indices, query_values = self.compute_query_vector(query)
 
-        sparse_query_vec = csr_array((query_values, (query_indices,)),shape=(self.vocab_size,))
+        sparse_query_vec = csr_array((query_values, (query_indices,)), shape=(self.vocab_size,))
         dists = [neg_dot_dist(sparse_query_vec, doc_vec) for doc_vec in self.sparse_doc_vecs]
         sorted_indices = np.argsort(dists)
 
-        return [Document(self.texts[i], self.metadatas[i]) for i in sorted_indices[:self.k]]
+        return [Document(self.texts[i], self.metadatas[i]) for i in sorted_indices[: self.k]]

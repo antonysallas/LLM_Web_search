@@ -1,23 +1,35 @@
-import time
-import re
+import gc
 import json
 import os
-from datetime import datetime
+import re
+import time
 from collections import defaultdict
+from datetime import datetime
 
 import gradio as gr
 import torch
 
 import modules.shared as shared
-from modules import chat, ui as ui_module
+from modules import chat
+from modules import ui as ui_module
+from modules.text_generation import generate_reply_custom, generate_reply_HF
 from modules.utils import gradio
-from modules.text_generation import generate_reply_HF, generate_reply_custom
 
 try:
-    from .llm_web_search import get_webpage_content, retrieve_from_duckduckgo, retrieve_from_searxng, Generator
+    from .llm_web_search import (
+        Generator,
+        get_webpage_content,
+        retrieve_from_duckduckgo,
+        retrieve_from_searxng,
+    )
     from .retrieval import DocumentRetriever, docs_to_pretty_str
 except ImportError:
-    from llm_web_search import get_webpage_content, retrieve_from_duckduckgo, retrieve_from_searxng, Generator
+    from llm_web_search import (
+        Generator,
+        get_webpage_content,
+        retrieve_from_duckduckgo,
+        retrieve_from_searxng,
+    )
     from retrieval import DocumentRetriever, docs_to_pretty_str
 
 
@@ -48,7 +60,7 @@ params = {
     "chunking method": "character-based",
     "chunker breakpoint_threshold_amount": 30,
     "simple search": False,
-    "client timeout": 10
+    "client timeout": 10,
 }
 custom_system_message_filename = None
 extension_path = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +68,29 @@ document_retriever = None
 update_history_dict = defaultdict(str)
 chat_id = None
 force_search = False
+
+
+# Modify the device selection:
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+device = get_device()
+print(f"Device used in Script: {device}")
+
+
+# Add this function and use it during generation
+def clear_memory():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        gc.collect()
+        torch.mps.empty_cache()
+        print("MPS cache cleared")
 
 
 def setup():
@@ -70,7 +105,7 @@ def setup():
         with open(os.path.join(extension_path, "settings.json"), "r") as f:
             saved_params = json.load(f)
         params.update(saved_params)
-        save_settings()   # add keys of newly added feature to settings.json
+        save_settings()  # add keys of newly added feature to settings.json
     except FileNotFoundError:
         save_settings()
 
@@ -85,16 +120,20 @@ def save_settings():
     with open(os.path.join(extension_path, "settings.json"), "w") as f:
         json.dump(params, f, indent=4)
     current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return gr.HTML(f'<span style="color:lawngreen"> Settings were saved at {current_datetime}</span>',
-                   visible=True)
+    return gr.HTML(
+        f'<span style="color:lawngreen"> Settings were saved at {current_datetime}</span>', visible=True
+    )
 
 
 def toggle_extension(_enable: bool):
     global document_retriever, custom_system_message_filename
     if _enable:
-        document_retriever = DocumentRetriever(device="cpu" if params["cpu only"] else "cuda",
-                                               keyword_retriever=params["keyword retriever"],
-                                               model_cache_dir=os.path.join(extension_path, "hf_models"))
+        document_retriever = DocumentRetriever(
+            device="cpu" if params["cpu only"] else device,
+            # device="cpu" if params["cpu only"] else "cuda",
+            keyword_retriever=params["keyword retriever"],
+            model_cache_dir=os.path.join(extension_path, "hf_models"),
+        )
         embedding_model = document_retriever.embedding_model
         embedding_model.to(embedding_model._target_device)
         custom_system_message_filename = params.get("default system prompt filename")
@@ -111,7 +150,8 @@ def toggle_extension(_enable: bool):
                         if hasattr(model, "to"):
                             model.to("cpu")
                         del model
-            torch.cuda.empty_cache()
+            clear_memory()
+            # torch.cuda.empty_cache()
     params.update({"enable": _enable})
     return _enable
 
@@ -136,7 +176,7 @@ def load_system_prompt(filename: str or None):
     if params["append current datetime"]:
         prompt_str += f"\nDate and time of conversation: {datetime.now().strftime('%A %d %B %Y %H:%M')}"
 
-    shared.settings['custom_system_message'] = prompt_str
+    shared.settings["custom_system_message"] = prompt_str
     custom_system_message_filename = filename
     return prompt_str
 
@@ -148,8 +188,7 @@ def save_system_prompt(filename, prompt):
     with open(os.path.join(extension_path, "system_prompts", filename), "w") as f:
         f.write(prompt)
 
-    return gr.HTML(f'<span style="color:lawngreen"> Saved successfully</span>',
-                   visible=True)
+    return gr.HTML(f'<span style="color:lawngreen"> Saved successfully</span>', visible=True)
 
 
 def check_file_exists(filename):
@@ -166,7 +205,7 @@ def timeout_save_message():
 
 
 def deactivate_system_prompt():
-    shared.settings['custom_system_message'] = None
+    shared.settings["custom_system_message"] = None
     return "None"
 
 
@@ -191,15 +230,13 @@ def ui():
     :return:
     """
     # Inject custom system message into the main textbox if a default one is set
-    shared.gradio['custom_system_message'].value = load_system_prompt(custom_system_message_filename)
-
+    shared.gradio["custom_system_message"].value = load_system_prompt(custom_system_message_filename)
 
     def toggle_full_search_options(simple_search: bool):
         if simple_search:
             return [gr.update(visible=False)] * 7
         else:
             return [gr.update(visible=True)] * 7
-
 
     def update_regex_setting(input_str: str, setting_key: str, error_html_element: gr.component):
         if input_str == "":
@@ -212,8 +249,11 @@ def ui():
             params.update({setting_key: input_str})
             return {error_html_element: gr.HTML("", visible=False)}
         except re.error as e:
-            return {error_html_element: gr.HTML(f'<span style="color:red"> Invalid regex. {str(e).capitalize()}</span>',
-                                                visible=True)}
+            return {
+                error_html_element: gr.HTML(
+                    f'<span style="color:red"> Invalid regex. {str(e).capitalize()}</span>', visible=True
+                )
+            }
 
     def update_default_custom_system_message(check: bool):
         if check:
@@ -222,116 +262,190 @@ def ui():
             params.update({"default system prompt filename": None})
 
     with gr.Row():
-        enable = gr.Checkbox(value=lambda: params['enable'], label='Enable LLM web search')
-        use_cpu_only = gr.Checkbox(value=lambda: params['cpu only'],
-                                   label='Run extension on CPU only '
-                                         '(Save settings and restart for the change to take effect)')
+        enable = gr.Checkbox(value=lambda: params["enable"], label="Enable LLM web search")
+        use_cpu_only = gr.Checkbox(
+            value=lambda: params["cpu only"],
+            label="Run extension on CPU only " "(Save settings and restart for the change to take effect)",
+        )
         with gr.Column():
             save_settings_btn = gr.Button("Save settings")
             saved_success_elem = gr.HTML("", visible=False)
 
     with gr.Row():
         with gr.Column():
-            search_type = gr.Radio([("Simple search", True), ("Full search", False)], label="Search type",
-                               value=lambda: params["simple search"])
+            search_type = gr.Radio(
+                [("Simple search", True), ("Full search", False)],
+                label="Search type",
+                value=lambda: params["simple search"],
+            )
         with gr.Column():
-            search_command_regex = gr.Textbox(label="Search command regex string",
-                                              placeholder=params["default search command regex"],
-                                              value=lambda: params["search command regex"])
+            search_command_regex = gr.Textbox(
+                label="Search command regex string",
+                placeholder=params["default search command regex"],
+                value=lambda: params["search command regex"],
+            )
             search_command_regex_error_label = gr.HTML("", visible=False)
 
         with gr.Column():
-            open_url_command_regex = gr.Textbox(label="Open URL command regex string",
-                                                placeholder=params["default open url command regex"],
-                                                value=lambda: params["open url command regex"])
+            open_url_command_regex = gr.Textbox(
+                label="Open URL command regex string",
+                placeholder=params["default open url command regex"],
+                value=lambda: params["open url command regex"],
+            )
             open_url_command_regex_error_label = gr.HTML("", visible=False)
 
         with gr.Column():
-            show_results = gr.Checkbox(value=lambda: params['display search results in chat'],
-                                       label='Display search results in chat')
-            show_url_content = gr.Checkbox(value=lambda: params['display extracted URL content in chat'],
-                                           label='Display extracted URL content in chat')
-    gr.Markdown(value='---')
+            show_results = gr.Checkbox(
+                value=lambda: params["display search results in chat"], label="Display search results in chat"
+            )
+            show_url_content = gr.Checkbox(
+                value=lambda: params["display extracted URL content in chat"],
+                label="Display extracted URL content in chat",
+            )
+    gr.Markdown(value="---")
     with gr.Row():
         with gr.Column():
-            gr.Markdown(value='#### Load custom system message\n'
-                              'Select a saved custom system message from within the system_prompts folder or "None" '
-                              'to clear the selection')
+            gr.Markdown(
+                value="#### Load custom system message\n"
+                'Select a saved custom system message from within the system_prompts folder or "None" '
+                "to clear the selection"
+            )
             system_prompt = gr.Dropdown(
-                choices=get_available_system_prompts(), label="Select custom system message",
-                value=lambda: 'Select custom system message to load...' if custom_system_message_filename is None else
-                              custom_system_message_filename, elem_classes='slim-dropdown')
+                choices=get_available_system_prompts(),
+                label="Select custom system message",
+                value=lambda: (
+                    "Select custom system message to load..."
+                    if custom_system_message_filename is None
+                    else custom_system_message_filename
+                ),
+                elem_classes="slim-dropdown",
+            )
             with gr.Row():
                 set_system_message_as_default = gr.Checkbox(
                     value=lambda: custom_system_message_filename == params["default system prompt filename"],
-                    label='Set this custom system message as the default')
-                refresh_button = ui_module.create_refresh_button(system_prompt, lambda: None,
-                                                                 lambda: {'choices': get_available_system_prompts()},
-                                                                 'refresh-button', interactive=True)
+                    label="Set this custom system message as the default",
+                )
+                refresh_button = ui_module.create_refresh_button(
+                    system_prompt,
+                    lambda: None,
+                    lambda: {"choices": get_available_system_prompts()},
+                    "refresh-button",
+                    interactive=True,
+                )
                 refresh_button.elem_id = "custom-sysprompt-refresh"
-                delete_button = gr.Button('🗑️', elem_classes='refresh-button', interactive=True)
-            append_datetime = gr.Checkbox(value=lambda: params['append current datetime'],
-                                          label='Append current date and time when loading custom system message')
+                delete_button = gr.Button("🗑️", elem_classes="refresh-button", interactive=True)
+            append_datetime = gr.Checkbox(
+                value=lambda: params["append current datetime"],
+                label="Append current date and time when loading custom system message",
+            )
         with gr.Column():
-            gr.Markdown(value='#### Create custom system message')
-            system_prompt_text = gr.Textbox(label="Custom system message", lines=3,
-                                            value=lambda: load_system_prompt(custom_system_message_filename))
+            gr.Markdown(value="#### Create custom system message")
+            system_prompt_text = gr.Textbox(
+                label="Custom system message",
+                lines=3,
+                value=lambda: load_system_prompt(custom_system_message_filename),
+            )
             sys_prompt_filename = gr.Text(label="Filename")
             sys_prompt_save_button = gr.Button("Save Custom system message")
             system_prompt_saved_success_elem = gr.HTML("", visible=False)
 
-    gr.Markdown(value='---')
+    gr.Markdown(value="---")
     with gr.Accordion("Advanced settings", open=False):
-        ensemble_weighting = gr.Slider(minimum=0, maximum=1, step=0.05, value=lambda: params["ensemble weighting"],
-                                       label="Ensemble Weighting", info="Smaller values = More keyword oriented, "
-                                                                        "Larger values = More focus on semantic similarity",
-                                       visible=not params["simple search"])
+        ensemble_weighting = gr.Slider(
+            minimum=0,
+            maximum=1,
+            step=0.05,
+            value=lambda: params["ensemble weighting"],
+            label="Ensemble Weighting",
+            info="Smaller values = More keyword oriented, "
+            "Larger values = More focus on semantic similarity",
+            visible=not params["simple search"],
+        )
         with gr.Row():
-            keyword_retriever = gr.Radio([("Okapi BM25", "bm25"),("SPLADE", "splade")], label="Sparse keyword retriever",
-                                         info="For change to take effect, toggle the extension off and on again",
-                                         value=lambda: params["keyword retriever"],
-                                         visible=not params["simple search"])
-            splade_batch_size = gr.Slider(minimum=2, maximum=256, step=2, value=lambda: params["splade batch size"],
-                                          label="SPLADE batch size",
-                                          info="Smaller values = Slower retrieval (but lower VRAM usage), "
-                                               "Larger values = Faster retrieval (but higher VRAM usage). "
-                                               "A good trade-off seems to be setting it = 8",
-                                          precision=0,
-                                          visible=not params["simple search"])
+            keyword_retriever = gr.Radio(
+                [("Okapi BM25", "bm25"), ("SPLADE", "splade")],
+                label="Sparse keyword retriever",
+                info="For change to take effect, toggle the extension off and on again",
+                value=lambda: params["keyword retriever"],
+                visible=not params["simple search"],
+            )
+            splade_batch_size = gr.Slider(
+                minimum=2,
+                maximum=256,
+                step=2,
+                value=lambda: params["splade batch size"],
+                label="SPLADE batch size",
+                info="Smaller values = Slower retrieval (but lower VRAM usage), "
+                "Larger values = Faster retrieval (but higher VRAM usage). "
+                "A good trade-off seems to be setting it = 8",
+                precision=0,
+                visible=not params["simple search"],
+            )
         with gr.Row():
-            chunker = gr.Radio([("Character-based", "character-based"),
-                                ("Semantic", "semantic")], label="Chunking method",
-                               value=lambda: params["chunking method"],
-                               visible=not params["simple search"])
-            chunker_breakpoint_threshold_amount = gr.Slider(minimum=1, maximum=100, step=1,
-                                                            value=lambda: params["chunker breakpoint_threshold_amount"],
-                                                            label="Semantic chunking: sentence split threshold (%)",
-                                                            info="Defines how different two consecutive sentences have"
-                                                                 " to be for them to be split into separate chunks",
-                                                            precision=0,
-                                                            visible=not params["simple search"])
-        client_timeout = gr.Number(label="Client timeout (in seconds)", info="When reached, pending or unfinished webpage "
-                                         "downloads will be cancelled to start the retrieval process immediately",
-                                   minimum=1, maximum=100,
-                                   value=lambda: params["client timeout"], precision=0)
-        gr.Markdown("**Note: Changing the following might result in DuckDuckGo rate limiting or the LM being overwhelmed**")
-        num_search_results = gr.Number(label="Max. search results to return per query", minimum=1, maximum=100,
-                                       value=lambda: params["search results per query"], precision=0)
-        num_process_search_results = gr.Number(label="Number of search results to process per query", minimum=1,
-                                               maximum=100, value=lambda: params["duckduckgo results per query"],
-                                               precision=0)
-        similarity_score_threshold = gr.Number(label="Similarity Score Threshold", minimum=0., maximum=1.,
-                                               value=lambda: params["langchain similarity score threshold"],
-                                               info="Discard chunks that are not similar "
-                                                    "enough to the search query and hence fall below the threshold.")
-        chunk_size = gr.Number(label="Max. chunk size", info="The maximal size of the individual chunks that each webpage will"
-                                     " be split into, in characters", minimum=2, maximum=10000,
-                               value=lambda: params["chunk size"], precision=0,
-                               visible=not params["simple search"])
+            chunker = gr.Radio(
+                [("Character-based", "character-based"), ("Semantic", "semantic")],
+                label="Chunking method",
+                value=lambda: params["chunking method"],
+                visible=not params["simple search"],
+            )
+            chunker_breakpoint_threshold_amount = gr.Slider(
+                minimum=1,
+                maximum=100,
+                step=1,
+                value=lambda: params["chunker breakpoint_threshold_amount"],
+                label="Semantic chunking: sentence split threshold (%)",
+                info="Defines how different two consecutive sentences have"
+                " to be for them to be split into separate chunks",
+                precision=0,
+                visible=not params["simple search"],
+            )
+        client_timeout = gr.Number(
+            label="Client timeout (in seconds)",
+            info="When reached, pending or unfinished webpage "
+            "downloads will be cancelled to start the retrieval process immediately",
+            minimum=1,
+            maximum=100,
+            value=lambda: params["client timeout"],
+            precision=0,
+        )
+        gr.Markdown(
+            "**Note: Changing the following might result in DuckDuckGo rate limiting or the LM being overwhelmed**"
+        )
+        num_search_results = gr.Number(
+            label="Max. search results to return per query",
+            minimum=1,
+            maximum=100,
+            value=lambda: params["search results per query"],
+            precision=0,
+        )
+        num_process_search_results = gr.Number(
+            label="Number of search results to process per query",
+            minimum=1,
+            maximum=100,
+            value=lambda: params["duckduckgo results per query"],
+            precision=0,
+        )
+        similarity_score_threshold = gr.Number(
+            label="Similarity Score Threshold",
+            minimum=0.0,
+            maximum=1.0,
+            value=lambda: params["langchain similarity score threshold"],
+            info="Discard chunks that are not similar "
+            "enough to the search query and hence fall below the threshold.",
+        )
+        chunk_size = gr.Number(
+            label="Max. chunk size",
+            info="The maximal size of the individual chunks that each webpage will"
+            " be split into, in characters",
+            minimum=2,
+            maximum=10000,
+            value=lambda: params["chunk size"],
+            precision=0,
+            visible=not params["simple search"],
+        )
 
     with gr.Row():
-        searxng_url = gr.Textbox(label="SearXNG URL",
-                                 value=lambda: params["searxng url"])
+        searxng_url = gr.Textbox(label="SearXNG URL", value=lambda: params["searxng url"])
 
     # Event functions to update the parameters in the backend
     enable.input(toggle_extension, enable, enable)
@@ -341,86 +455,123 @@ def ui():
     keyword_retriever.change(lambda x: params.update({"keyword retriever": x}), keyword_retriever, None)
     splade_batch_size.change(lambda x: params.update({"splade batch size": x}), splade_batch_size, None)
     chunker.change(lambda x: params.update({"chunking method": x}), chunker, None)
-    chunker_breakpoint_threshold_amount.change(lambda x: params.update({"chunker breakpoint_threshold_amount": x}),
-                                               chunker_breakpoint_threshold_amount, None)
+    chunker_breakpoint_threshold_amount.change(
+        lambda x: params.update({"chunker breakpoint_threshold_amount": x}),
+        chunker_breakpoint_threshold_amount,
+        None,
+    )
     client_timeout.change(lambda x: params.update({"client timeout": x}), client_timeout, None)
-    num_search_results.change(lambda x: params.update({"search results per query": x}), num_search_results, None)
-    num_process_search_results.change(lambda x: params.update({"duckduckgo results per query": x}),
-                                      num_process_search_results, None)
-    similarity_score_threshold.change(lambda x: params.update({"langchain similarity score threshold": x}),
-                                      similarity_score_threshold, None)
+    num_search_results.change(
+        lambda x: params.update({"search results per query": x}), num_search_results, None
+    )
+    num_process_search_results.change(
+        lambda x: params.update({"duckduckgo results per query": x}), num_process_search_results, None
+    )
+    similarity_score_threshold.change(
+        lambda x: params.update({"langchain similarity score threshold": x}), similarity_score_threshold, None
+    )
     chunk_size.change(lambda x: params.update({"chunk size": x}), chunk_size, None)
-    search_type.change(lambda x: params.update({"simple search": x}),
-                       search_type,
-                       None).then(toggle_full_search_options, search_type, [ensemble_weighting, keyword_retriever,
-                                                                            splade_batch_size, chunker, chunk_size,
-                                                                            chunker_breakpoint_threshold_amount,
-                                                                            client_timeout])
+    search_type.change(lambda x: params.update({"simple search": x}), search_type, None).then(
+        toggle_full_search_options,
+        search_type,
+        [
+            ensemble_weighting,
+            keyword_retriever,
+            splade_batch_size,
+            chunker,
+            chunk_size,
+            chunker_breakpoint_threshold_amount,
+            client_timeout,
+        ],
+    )
 
-    search_command_regex.change(lambda x: update_regex_setting(x, "search command regex",
-                                                               search_command_regex_error_label),
-                                search_command_regex, search_command_regex_error_label, show_progress="hidden")
+    search_command_regex.change(
+        lambda x: update_regex_setting(x, "search command regex", search_command_regex_error_label),
+        search_command_regex,
+        search_command_regex_error_label,
+        show_progress="hidden",
+    )
 
-    open_url_command_regex.change(lambda x: update_regex_setting(x, "open url command regex",
-                                                                 open_url_command_regex_error_label),
-                                  open_url_command_regex, open_url_command_regex_error_label, show_progress="hidden")
+    open_url_command_regex.change(
+        lambda x: update_regex_setting(x, "open url command regex", open_url_command_regex_error_label),
+        open_url_command_regex,
+        open_url_command_regex_error_label,
+        show_progress="hidden",
+    )
 
     show_results.change(lambda x: params.update({"display search results in chat": x}), show_results, None)
-    show_url_content.change(lambda x: params.update({"display extracted URL content in chat": x}), show_url_content,
-                            None)
+    show_url_content.change(
+        lambda x: params.update({"display extracted URL content in chat": x}), show_url_content, None
+    )
     searxng_url.change(lambda x: params.update({"searxng url": x}), searxng_url, None)
 
-    delete_button.click(
-        lambda x: x, system_prompt, gradio('delete_filename')).then(
-        lambda: os.path.join(extension_path, "system_prompts", ""), None, gradio('delete_root')).then(
-        lambda: gr.update(visible=True), None, gradio('file_deleter'))
-    shared.gradio['delete_confirm'].click(
-        lambda: "None", None, system_prompt).then(
-        None, None, None, _js="() => { document.getElementById('custom-sysprompt-refresh').click() }")
-    system_prompt.change(load_system_prompt, system_prompt, shared.gradio['custom_system_message'])
+    delete_button.click(lambda x: x, system_prompt, gradio("delete_filename")).then(
+        lambda: os.path.join(extension_path, "system_prompts", ""), None, gradio("delete_root")
+    ).then(lambda: gr.update(visible=True), None, gradio("file_deleter"))
+    shared.gradio["delete_confirm"].click(lambda: "None", None, system_prompt).then(
+        None, None, None, _js="() => { document.getElementById('custom-sysprompt-refresh').click() }"
+    )
+    system_prompt.change(load_system_prompt, system_prompt, shared.gradio["custom_system_message"])
     system_prompt.change(load_system_prompt, system_prompt, system_prompt_text)
     # restore checked state if chosen system prompt matches the default
-    system_prompt.change(lambda x: x == params["default system prompt filename"], system_prompt,
-                         set_system_message_as_default)
+    system_prompt.change(
+        lambda x: x == params["default system prompt filename"], system_prompt, set_system_message_as_default
+    )
     sys_prompt_filename.change(check_file_exists, sys_prompt_filename, system_prompt_saved_success_elem)
-    sys_prompt_save_button.click(save_system_prompt, [sys_prompt_filename, system_prompt_text],
-                                 system_prompt_saved_success_elem,
-                                 show_progress="hidden").then(timeout_save_message,
-                                                              None,
-                                                              system_prompt_saved_success_elem,
-                                                              _js="() => { document.getElementById('custom-sysprompt-refresh').click() }",
-                                                              show_progress="hidden").then(lambda: "", None,
-                                                                                        sys_prompt_filename,
-                                                                                        show_progress="hidden")
+    sys_prompt_save_button.click(
+        save_system_prompt,
+        [sys_prompt_filename, system_prompt_text],
+        system_prompt_saved_success_elem,
+        show_progress="hidden",
+    ).then(
+        timeout_save_message,
+        None,
+        system_prompt_saved_success_elem,
+        _js="() => { document.getElementById('custom-sysprompt-refresh').click() }",
+        show_progress="hidden",
+    ).then(
+        lambda: "", None, sys_prompt_filename, show_progress="hidden"
+    )
     append_datetime.change(lambda x: params.update({"append current datetime": x}), append_datetime, None)
     # '.input' = only triggers when user changes the value of the component, not a function
-    set_system_message_as_default.input(update_default_custom_system_message, set_system_message_as_default, None)
+    set_system_message_as_default.input(
+        update_default_custom_system_message, set_system_message_as_default, None
+    )
 
     # A dummy checkbox to enable the actual "Force web search" checkbox to trigger a gradio event
     force_search_checkbox = gr.Checkbox(value=False, visible=False, elem_id="Force-search-checkbox")
     force_search_checkbox.change(toggle_forced_search, force_search_checkbox, None)
 
     # Add event listener to "Past chats" radio menu to get the current unique chat ID
-    shared.gradio['unique_id'].change(update_chat_id, shared.gradio['unique_id'], None)
+    shared.gradio["unique_id"].change(update_chat_id, shared.gradio["unique_id"], None)
 
     # Don't update internal history with search results if last reply was removed
-    shared.gradio['Remove last'].click(clear_update_history_dict, None, None)
+    shared.gradio["Remove last"].click(clear_update_history_dict, None, None)
 
 
-def custom_generate_reply(question, original_question, seed, state, stopping_strings, is_chat, recursive_call=False):
+def custom_generate_reply(
+    question, original_question, seed, state, stopping_strings, is_chat, recursive_call=False
+):
     """
     Overrides the main text generation function.
     :return:
     """
     global update_history_dict, document_retriever
-    if shared.model.__class__.__name__ in ['LlamaCppModel', 'RWKVModel', 'ExllamaModel', 'Exllamav2Model',
-                                           'CtransformersModel']:
+    if shared.model.__class__.__name__ in [
+        "LlamaCppModel",
+        "RWKVModel",
+        "ExllamaModel",
+        "Exllamav2Model",
+        "CtransformersModel",
+    ]:
         generate_func = generate_reply_custom
     else:
         generate_func = generate_reply_HF
 
-    if not params['enable']:
-        for reply in generate_func(question, original_question, seed, state, stopping_strings, is_chat=is_chat):
+    if not params["enable"]:
+        for reply in generate_func(
+            question, original_question, seed, state, stopping_strings, is_chat=is_chat
+        ):
             yield reply
         return
 
@@ -456,7 +607,9 @@ def custom_generate_reply(question, original_question, seed, state, stopping_str
     if force_search and not recursive_call:
         question += f" {params['force search prefix']}"
 
-    model_reply_gen = generate_func(question, original_question, seed, state, stopping_strings, is_chat=is_chat)
+    model_reply_gen = generate_func(
+        question, original_question, seed, state, stopping_strings, is_chat=is_chat
+    )
     reply = None
     for reply in model_reply_gen:
 
@@ -474,18 +627,22 @@ def custom_generate_reply(question, original_question, seed, state, stopping_str
             reply += "\n```plaintext"
             reply += "\nSearch tool:\n"
             if searxng_url == "":
-                search_generator = Generator(retrieve_from_duckduckgo(search_term,
-                                                                      document_retriever,
-                                                                      max_search_results,
-                                                                      instant_answers,
-                                                                      simple_search))
+                search_generator = Generator(
+                    retrieve_from_duckduckgo(
+                        search_term, document_retriever, max_search_results, instant_answers, simple_search
+                    )
+                )
             else:
-                search_generator = Generator(retrieve_from_searxng(search_term,
-                                                                   searxng_url,
-                                                                   document_retriever,
-                                                                   max_search_results,
-                                                                   instant_answers,
-                                                                   simple_search))
+                search_generator = Generator(
+                    retrieve_from_searxng(
+                        search_term,
+                        searxng_url,
+                        document_retriever,
+                        max_search_results,
+                        instant_answers,
+                        simple_search,
+                    )
+                )
             try:
                 for status_message in search_generator:
                     yield original_model_reply + f"\n*{status_message}*"
@@ -494,7 +651,7 @@ def custom_generate_reply(question, original_question, seed, state, stopping_str
             except Exception as exc:
                 exception_message = str(exc)
                 reply += f"The search tool encountered an error: {exception_message}"
-                print(f'LLM_Web_search | {search_term} generated an exception: {exception_message}')
+                print(f"LLM_Web_search | {search_term} generated an exception: {exception_message}")
             else:
                 if search_results != "":
                     reply += search_results
@@ -519,7 +676,7 @@ def custom_generate_reply(question, original_question, seed, state, stopping_str
                 webpage_content = get_webpage_content(url)
             except Exception as exc:
                 reply += f"Couldn't open {url}. Error message: {str(exc)}"
-                print(f'LLM_Web_search | {url} generated an exception: {str(exc)}')
+                print(f"LLM_Web_search | {url} generated an exception: {str(exc)}")
             else:
                 reply += f"\nText content of {url}:\n"
                 reply += webpage_content
@@ -534,8 +691,9 @@ def custom_generate_reply(question, original_question, seed, state, stopping_str
         # Add results to context and continue model output
         new_question = chat.generate_chat_prompt(f"{question}{reply}", state)
         new_reply = ""
-        for new_reply in custom_generate_reply(new_question, new_question, seed, state,
-                                               stopping_strings, is_chat=is_chat, recursive_call=True):
+        for new_reply in custom_generate_reply(
+            new_question, new_question, seed, state, stopping_strings, is_chat=is_chat, recursive_call=True
+        ):
             if display_results:
                 yield f"{reply}{new_reply}"
             else:
@@ -546,7 +704,6 @@ def custom_generate_reply(question, original_question, seed, state, stopping_str
     else:
         if recursive_call and not display_search_results:
             update_history_dict[state["unique_id"]] = f"{reply}\n{update_history_dict[state['unique_id']]}"
-
 
 
 def output_modifier(string, state, is_chat=False):
@@ -567,7 +724,7 @@ def custom_css():
     Returns custom CSS as a string. It is applied whenever the web UI is loaded.
     :return:
     """
-    return ''
+    return ""
 
 
 def custom_js():
